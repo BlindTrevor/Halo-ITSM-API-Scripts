@@ -35,37 +35,65 @@
 #>
 
 # ===========================================================================
-#  SETTINGS
+#  CONFIGURATION
+#  -------------------------------------------------------------------------
+#  Everything you may need to change is in this one block. Work down it:
+#  connection first, then the two ticket type ids, then taste.
 # ===========================================================================
 
-$ClientId     = ''
-$ClientSecret = ''
+# --- Connection -------------------------------------------------------------
+
+$Tenant       = 'contoso'  # first part of your Halo URL: https://<tenant>.haloitsm.com
+$ClientId     = ''         # blank = $env:HALO_CLIENT_ID, then a masked prompt
+$ClientSecret = ''         # blank = $env:HALO_CLIENT_SECRET, then a masked prompt
+$Scope        = 'all'      # /api/Agent and /api/Status may 403 on anything narrower
+
+# Only needed if Halo is self-hosted, or if the "Authorisation Server" shown
+# in Configuration > Integrations > Halo API is not the address below.
+# Leave both blank to build them from $Tenant.
+$AuthUrl      = ''         # e.g. 'https://halo.example.com/auth/token'
+$ApiBase      = ''         # e.g. 'https://halo.example.com/api'
+
+# --- Your tenant's ids ------------------------------------------------------
+# These differ per tenant and there is no safe default. Halo's display names
+# carry stray whitespace, so match on id and never on name. A dry run of
+# New-HaloProject.ps1 prints every ticket type it can see, with ids.
+
+$TYPE_PROJECT = 57
+$TYPE_TASK    = 58
+
+# --- What goes in the report ------------------------------------------------
 
 $OutFile       = ''        # blank = Documents\Halo-Projects-<timestamp>.html
 $IncludeClosed = $true     # closed records matter - they set rolled-up starts
 $OpenWhenDone  = $true     # launch the report in the default browser
-$AgentFilter   = '*'       # '*' = whole team, or e.g. 'Andrew Samuel'
+$AgentFilter   = '*'       # '*' = whole team, or e.g. 'Jane Smith'
 
-# Agents who have left are deactivated in Halo and vanish from /api/Agent, so
-# their tickets come back as "id:NN". Name them here and they read properly
-# everywhere - chart, workload table, owner filter and every task row.
+# --- Agents who have left ---------------------------------------------------
+# Deactivated agents vanish from /api/Agent, so their tickets come back as
+# "id:NN". Name them here and they read properly everywhere - chart, workload
+# table, owner filter and every task row.
 # NOTE: bare numeric keys in a hashtable literal are INTEGERS. Look them up
 # with an int, never with "$id", or the lookup silently never matches.
+
 $FormerAgents = @{
     13 = 'Joe Bloggs'
 }
 $FormerSuffix  = ' (left)'   # set to '' to show the name with no marker
 
+# --- Advanced ---------------------------------------------------------------
+
+$PAGE = 100                # records per API page. 1000 is Halo's hard cap, and
+                           # it returns the NEWEST 1000 while still reporting
+                           # record_count=1000 - so page, never count.
+
+# ===========================================================================
+#  NOTHING BELOW HERE NEEDS EDITING
 # ===========================================================================
 
 $ErrorActionPreference = 'Stop'
-$Tenant  = 'contoso'
-$AuthUrl = "https://$Tenant.haloitsm.com/auth/token"
-$ApiBase = "https://$Tenant.haloitsm.com/api"
-$Scope   = 'all'           # /api/Agent and /api/Status may 403 on a narrower scope
-$TYPE_PROJECT = 57
-$TYPE_TASK    = 58
-$PAGE         = 100
+if ([string]::IsNullOrWhiteSpace($AuthUrl)) { $AuthUrl = "https://$Tenant.haloitsm.com/auth/token" }
+if ([string]::IsNullOrWhiteSpace($ApiBase)) { $ApiBase = "https://$Tenant.haloitsm.com/api" }
 
 # ---------------------------------------------------------------------------
 #  HELPERS
@@ -138,17 +166,43 @@ function Esc {
     return [System.Net.WebUtility]::HtmlEncode([string]$t)
 }
 
+function Format-ErrorBody {
+    # A bad tenant or a server-side fault answers with a whole error PAGE - a
+    # quarter of a megabyte of CSS and inline base64 images, which buries the
+    # console. The useful case is the small JSON body Halo returns for a bad
+    # credential, so keep that intact and reduce everything else to the first
+    # readable sentence.
+    param([string]$Body)
+    if ([string]::IsNullOrWhiteSpace($Body)) { return '' }
+    $s = $Body.Trim()
+
+    if (-not ($s.StartsWith('{') -or $s.StartsWith('['))) {
+        # Not JSON, so it is a page. Note that Invoke-RestMethod has usually
+        # stripped the tags already, leaving bare stylesheet text behind.
+        $s = $s -replace '(?s)<(script|style)\b.*?(</\1>|$)', ' '
+        $s = $s -replace '(?s)<[^>]+>', ' '
+        $s = [System.Net.WebUtility]::HtmlDecode($s)
+        $s = $s -replace 'data:[^;,\s]*;base64,[A-Za-z0-9+/=]*', '[embedded data]'
+        $s = $s -replace '(?s)\{[^{}]*\}', ' '          # css rules
+        $s = $s -replace '[A-Za-z0-9+/=]{80,}', '[blob]'
+    }
+
+    $s = ($s -replace '\s+', ' ').Trim()
+    if ($s.Length -gt 400) { $s = $s.Substring(0, 400) + '... (truncated)' }
+    return $s
+}
+
 function Get-WebErrorBody {
     param($ErrorRecord)
     if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
-        return $ErrorRecord.ErrorDetails.Message
+        return Format-ErrorBody $ErrorRecord.ErrorDetails.Message
     }
     try {
         $resp = $ErrorRecord.Exception.Response
         if ($null -eq $resp) { return '' }
         $st = $resp.GetResponseStream()
         try { $st.Position = 0 } catch { }
-        return (New-Object System.IO.StreamReader($st)).ReadToEnd()
+        return Format-ErrorBody (New-Object System.IO.StreamReader($st)).ReadToEnd()
     } catch { return '' }
 }
 

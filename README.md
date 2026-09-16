@@ -4,9 +4,8 @@ PowerShell scripts for working with projects and project tasks in
 [Halo ITSM](https://haloitsm.com) over its REST API.
 
 Each script is self-contained: no modules, no parameters, no config files.
-Open one in PowerShell ISE, paste your credentials into the settings block at
-the top, press F5. Everything you need to change is in that block — the rest
-of each file is machinery and does not need editing.
+Open one in PowerShell ISE, fill in the `CONFIGURATION` block at the top,
+press F5.
 
 ## Which script do I want?
 
@@ -15,6 +14,39 @@ of each file is machinery and does not need editing.
 | [`New-HaloProject.ps1`](New-HaloProject.ps1) | **writes** | Creates one project and its tasks from a table you fill in. |
 | [`New-HaloProjectReport.ps1`](New-HaloProjectReport.ps1) | read-only | HTML report across *every* project in the tenant. |
 | [`New-HaloProjectStatusReport.ps1`](New-HaloProjectStatusReport.ps1) | read-only | HTML status report for *one* project. |
+
+## Configuration
+
+Every script follows the same layout. One `CONFIGURATION` block sits at the
+top, and it ends at a line you cannot miss:
+
+```
+# ===========================================================================
+#  NOTHING BELOW HERE NEEDS EDITING
+# ===========================================================================
+```
+
+Everything above that line is yours to change; everything below it is
+machinery. The block is divided into labelled sections, in the order you need
+them:
+
+| Section | What is in it |
+| --- | --- |
+| `--- The only switch you need` | `New-HaloProject.ps1` only: `$Apply`, dry run versus create. |
+| `--- Connection` | `$Tenant`, `$ClientId`, `$ClientSecret`, `$Scope`, and `$AuthUrl` / `$ApiBase` for self-hosted Halo. |
+| `--- Your tenant's ids` | The project and task ticket type ids. |
+| *script-specific* | What goes in the report, which project, the project and its tasks. |
+| `--- Agents who have left` | `$FormerAgents`, `$FormerSuffix` (reports only). |
+| `--- How the RAG verdict is judged` | Thresholds and status-name lists (status report only). |
+| `--- Advanced` | `$PAGE`, the API page size. Rarely touched. |
+
+The variables you are most likely to change, per script:
+
+| Script | Settings |
+| --- | --- |
+| `New-HaloProject.ps1` | `$Apply`, `$ProjectTypeId`, `$TaskTypeId`, `$PriorityMap`, `$AgentMap`, `$ProjectSummary`, `$ProjectStart`, `$ProjectTarget`, `$ProjectBlurb`, `$SourceNote`, `$Records`, `$ExistingProjectId`, `$OnlyIds` |
+| `New-HaloProjectReport.ps1` | `$TYPE_PROJECT`, `$TYPE_TASK`, `$OutFile`, `$IncludeClosed`, `$OpenWhenDone`, `$AgentFilter`, `$FormerAgents` |
+| `New-HaloProjectStatusReport.ps1` | `$TYPE_PROJECT`, `$TYPE_TASK`, `$ProjectId`, `$OutFile`, `$OpenWhenDone`, `$FormerAgents`, `$NearEndPct`, `$NearEndDays`, `$DueSoonDays`, the three status-name lists, `$LateInProgressIsRed` |
 
 ---
 
@@ -101,22 +133,28 @@ Defaults to `Documents\Halo-Project-<id>-<name>-<timestamp>.html`.
 
 ### 2. Set your tenant
 
-Every script ships with the placeholder `$Tenant = 'contoso'`. Change it to
-your own tenant name, which is the first part of your Halo URL:
+Every script ships with the placeholder `$Tenant = 'contoso'`, the first line
+of the `--- Connection` section. Change it to your own tenant name, which is
+the first part of your Halo URL:
 
 ```powershell
 $Tenant = 'yourtenant'      # https://yourtenant.haloitsm.com
 ```
 
-If your Halo is self-hosted, or the **Authorisation Server** shown on the Halo
-API page is not `https://<tenant>.haloitsm.com/auth/token`, set `$AuthUrl` to
-match it.
+`$AuthUrl` and `$ApiBase` are built from `$Tenant` while they are left blank.
+Fill them in only if Halo is self-hosted, or if the **Authorisation Server**
+shown on the Halo API page is not `https://<tenant>.haloitsm.com/auth/token`:
+
+```powershell
+$AuthUrl = 'https://halo.example.com/auth/token'
+$ApiBase = 'https://halo.example.com/api'
+```
 
 ### 3. Supply credentials
 
 All three scripts look in the same three places, in order:
 
-1. `$ClientId` / `$ClientSecret` at the top of the script
+1. `$ClientId` / `$ClientSecret` in the `--- Connection` section
 2. the `HALO_CLIENT_ID` and `HALO_CLIENT_SECRET` environment variables
 3. a masked prompt
 
@@ -133,18 +171,19 @@ $env:HALO_CLIENT_SECRET = '...'
 These scripts were written against one tenant, and a few values in them are
 specific to it. Check each one:
 
-- **Ticket type ids.** The reports hardcode `$TYPE_PROJECT = 57` and
-  `$TYPE_TASK = 58`. Yours will differ. `New-HaloProject.ps1` is better
-  behaved: leave `$ProjectTypeId` and `$TaskTypeId` at `0` and its dry run
-  prints every ticket type it can see, with ids. Match on **id**, never on
-  name — the display names carry stray whitespace.
+- **Ticket type ids.** Under `--- Your tenant's ids`, the reports
+  default to `$TYPE_PROJECT = 57` and `$TYPE_TASK = 58`. Yours will differ.
+  `New-HaloProject.ps1` is better behaved: leave `$ProjectTypeId` and
+  `$TaskTypeId` at `0` and its dry run prints every ticket type it can see,
+  with ids — then paste them into all three scripts. Match on **id**, never on
+  name, because the display names carry stray whitespace.
 - **Priority and agent ids.** Same story: the dry run prints them, and you
   paste them into `$PriorityMap` and `$AgentMap`.
 - **Status names.** `New-HaloProjectStatusReport.ps1` decides whether a task is
   not started, on hold or in progress by matching status names, which are
   tenant-specific. It prints the mapping it used and names anything it could
-  not place. Read that once, adjust the three lists at the top, and it stays
-  right from then on.
+  not place. Read that once, adjust the three lists under
+  `--- How the RAG verdict is judged`, and it stays right from then on.
 - **Departed agents.** Deactivated agents vanish from `/api/Agent`, so their
   tickets show as `id:NN`. Name them in `$FormerAgents` in either report and
   they read properly throughout.

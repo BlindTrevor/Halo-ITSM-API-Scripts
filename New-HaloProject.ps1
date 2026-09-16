@@ -5,8 +5,9 @@
     hanging off it, from a table of records held at the top of this file.
 
     Open it in PowerShell ISE (or any editor + console) and press F5. No
-    parameters, no external files - everything you change is in the two
-    settings blocks below.
+    parameters, no external files - everything you change is in the single
+    CONFIGURATION block below, which ends at "NOTHING BELOW HERE NEEDS
+    EDITING".
 
       1. Leave $Apply as $false the first time. That is a DRY RUN - it gets a
          token, reads your ticket types, priorities and agents, validates the
@@ -25,13 +26,13 @@
     hanging off the project and skips any whose summary it already sees. If
     the project itself already exists, put its id in $ExistingProjectId.
 
-    EDIT CHECKLIST
-      $ProjectSummary / $ProjectStart / $ProjectTarget / $ProjectBlurb
+    EDIT CHECKLIST - in the order the CONFIGURATION block presents them:
+      $Tenant / $ClientId / $ClientSecret   (connection)
       $ProjectTypeId / $TaskTypeId          (from the dry run)
       $PriorityMap / $AgentMap              (from the dry run)
+      $ProjectSummary / $ProjectStart / $ProjectTarget / $ProjectBlurb
       $HaloClientId / $HaloSiteId           (optional)
       $Records                              (your tasks)
-      $Tenant                               (your Halo tenant)
 
     RECORD SCHEMA - one [pscustomobject] per task:
       id           short unique key, e.g. A1. Sorts and prefixes the summary,
@@ -55,51 +56,32 @@
 #>
 
 # ===========================================================================
-#  THE ONLY SWITCH YOU NEED
+#  CONFIGURATION
+#  -------------------------------------------------------------------------
+#  Everything you may need to change is in this one block. Work down it: the
+#  switch, connection, your tenant's ids, the project, then the tasks.
 # ===========================================================================
 
-$Apply = $false        # $false = dry run (safe).  $true = create records.
+# --- The only switch you need -----------------------------------------------
 
-# Paste your Halo API credentials between the quotes. Leave them empty and
-# the script falls back to $env:HALO_CLIENT_ID / $env:HALO_CLIENT_SECRET,
-# and then to prompting you.
-$ClientId     = ''
-$ClientSecret = ''
+$Apply = $false            # $false = dry run (safe).  $true = create records.
 
-$Tenant       = 'contoso'      # your Halo tenant name
+# --- Connection -------------------------------------------------------------
 
-# ===========================================================================
-#  SETTINGS - THE PROJECT
-# ===========================================================================
+$Tenant       = 'contoso'  # first part of your Halo URL: https://<tenant>.haloitsm.com
+$ClientId     = ''         # blank = $env:HALO_CLIENT_ID, then a masked prompt
+$ClientSecret = ''         # blank = $env:HALO_CLIENT_SECRET, then a masked prompt
+$Scope        = 'edit:tickets'
 
-$ProjectSummary = 'Example Project - rename me'
-$ProjectStart   = '2026-10-01'
-$ProjectTarget  = '2026-12-18'
+# Only needed if Halo is self-hosted, or if the "Authorisation Server" shown
+# in Configuration > Integrations > Halo API is not the address below.
+# Leave both blank to build them from $Tenant.
+$AuthUrl      = ''         # e.g. 'https://halo.example.com/auth/token'
+$ApiBase      = ''         # e.g. 'https://halo.example.com/api'
 
-# Free text for the top of the project ticket. The workstream legend and the
-# task count are appended automatically from $Records, so do not list them
-# here - they will only drift.
-$ProjectBlurb = @(
-    'One line on what this project is for.'
-    'One line on where it came from - a meeting, a ticket, a decision.'
-) -join "`r`n"
-
-# Stamped at the bottom of every task's details. Set it to the meeting,
-# document or ticket the task list came from.
-$SourceNote = 'Created by New-HaloProject.ps1.'
-
-$ExistingProjectId = 0   # 0 = create the project. After a successful run the
-                         # script prints the new id - paste it here to add or
-                         # re-run tasks against the same project.
-
-# ===========================================================================
-#  SETTINGS - YOUR TENANT
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
+# --- Your tenant's ids ------------------------------------------------------
 # These two are REQUIRED and are specific to your tenant. Run the dry run
 # once with both at 0: it prints the ticket types it can see, with their ids.
-# ---------------------------------------------------------------------------
 $ProjectTypeId = 0        # ticket type id used for Projects
 $TaskTypeId    = 0        # ticket type id used for Project Tasks
 
@@ -135,11 +117,32 @@ $PrefixSummaryWithId = $true   # "A1 - Confirm scope and success criteria"
 $OnlyIds = @()                 # Optional: limit to certain task ids,
                                # e.g. @('B1','B2'). Empty = all of them.
 
-# ===========================================================================
-#  THE TASKS
-# ===========================================================================
-# Replace everything below with your own. The six here are a worked example
-# of the shape, not a suggestion - delete them.
+# --- The project ------------------------------------------------------------
+
+$ProjectSummary = 'Example Project - rename me'
+$ProjectStart   = '2026-10-01'
+$ProjectTarget  = '2026-12-18'
+
+# Free text for the top of the project ticket. The workstream legend and the
+# task count are appended automatically from $Records, so do not list them
+# here - they will only drift.
+$ProjectBlurb = @(
+    'One line on what this project is for.'
+    'One line on where it came from - a meeting, a ticket, a decision.'
+) -join "`r`n"
+
+# Stamped at the bottom of every task's details. Set it to the meeting,
+# document or ticket the task list came from.
+$SourceNote = 'Created by New-HaloProject.ps1.'
+
+$ExistingProjectId = 0   # 0 = create the project. After a successful run the
+                         # script prints the new id - paste it here to add or
+                         # re-run tasks against the same project.
+
+# --- The tasks --------------------------------------------------------------
+# Replace these with your own. The six here are a worked example of the
+# shape, not a suggestion - delete them. The record schema is documented in
+# the header at the top of this file.
 
 $Records = @(
     [pscustomobject]@{ id='A1'; summary='Confirm scope and success criteria'; workstream='A - Scoping and approvals'; owner='Alex'; agentkey='Alex'; priority='High'; start='2026-10-01'; target='2026-10-07'; days=5; deps='-'; description='Write down what is in and out of scope, who the stakeholders are, and what the project has to achieve to count as finished. Circulate for comment rather than assuming agreement.'; donewhen='Scope agreed in writing by the stakeholders named above.' }
@@ -157,10 +160,12 @@ $Records = @(
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$AuthUrl   = "https://$Tenant.haloitsm.com/auth/token"
-$ApiBase   = "https://$Tenant.haloitsm.com/api"
+if ([string]::IsNullOrWhiteSpace($AuthUrl)) { $AuthUrl = "https://$Tenant.haloitsm.com/auth/token" }
+if ([string]::IsNullOrWhiteSpace($ApiBase)) { $ApiBase = "https://$Tenant.haloitsm.com/api" }
+
+# Dates are sent at midday so a timezone conversion cannot roll one over a
+# day boundary on the way in.
 $TimeOfDay = 'T12:00:00'
-$Scope     = 'edit:tickets'
 
 # --- credentials ----------------------------------------------------------
 function Resolve-Credential {
