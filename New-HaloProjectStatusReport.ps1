@@ -58,11 +58,33 @@ $FormerAgents = @{
 }
 $FormerSuffix  = ' (left)'   # set to '' to show the name with no marker
 
-# How the RAG verdict is decided. These are the only knobs, and the report
-# always prints its reasoning beside the colour, so nobody has to guess.
-$AmberBehindBy = 10        # work this many points behind elapsed schedule = amber
-$RedBehindBy   = 30        # this far behind = red
-$DueSoonDays   = 14        # what counts as "landing shortly"
+# How the RAG verdict is decided. A project is not in trouble because a burn-up
+# figure says so - a team can be 40% through the calendar with 10% of the work
+# closed and be perfectly fine, because the big tasks are under way. It is in
+# trouble when individual tasks are past their end date, or when a task is
+# running out of its OWN window and nobody has picked it up. So the verdict is
+# built from the tasks, and every reason is printed beside the colour.
+$NearEndPct  = 75          # a task this far through its own window is closing in
+$NearEndDays = 5           # ...or this close to its end date, whichever comes first
+$DueSoonDays = 14          # horizon for the "what is coming" table
+
+# Whether anybody is actually working a task is a question about its status,
+# and status names are tenant-specific. These are matched with -like, which is
+# case-insensitive. Anything not listed here and not closed is taken to be IN
+# PROGRESS, so an unfamiliar status never invents a problem. The report prints
+# the mapping it used and the console names anything it could not place - read
+# it once, adjust these, and it stays right from then on.
+$NotStartedStatuses = @('New','Logged','Raised','To Do','Backlog','Scheduled','Unassigned','*not started*')
+$OnHoldStatuses     = @('*hold*','*waiting*','*with customer*','*with user*','*with supplier*',
+                        '*with third party*','*pending*','*blocked*','*approval*','*deferred*')
+$InProgressStatuses = @('*progress*','*started*','*underway*','*being *','*in hand*','*with agent*','*assigned*')
+
+# A task past its end date that somebody is actively working: red, or amber?
+# It defaults to red, because the date has gone whatever anyone is doing about
+# it, and a status report that quietly swallows that is not worth reading.
+# Set it to $false if your team runs to soft end dates and only wants red when
+# a late task has nobody on it.
+$LateInProgressIsRed = $true
 
 # ===========================================================================
 
@@ -508,7 +530,25 @@ Head 'BUILDING'
 
 $today   = (Get-Date).ToString('yyyy-MM-dd')
 $nowD    = (Get-Date).Date
-$soonIso = $nowD.AddDays($DueSoonDays).ToString('yyyy-MM-dd')
+
+function Test-StatusListed {
+    # did the tenant's status name actually appear in one of the lists, or did
+    # it fall through to the in-progress default? The report has to be able to
+    # say which, or the mapping is unauditable.
+    param([string]$s)
+    foreach ($p in $NotStartedStatuses) { if ($s -like $p) { return $true } }
+    foreach ($p in $OnHoldStatuses)     { if ($s -like $p) { return $true } }
+    foreach ($p in $InProgressStatuses) { if ($s -like $p) { return $true } }
+    return $false
+}
+
+function Get-TaskState {
+    param([string]$StatusName, [bool]$IsClosed)
+    if ($IsClosed) { return 'closed' }
+    foreach ($p in $NotStartedStatuses) { if ($StatusName -like $p) { return 'new' } }
+    foreach ($p in $OnHoldStatuses)     { if ($StatusName -like $p) { return 'hold' } }
+    return 'progress'
+}
 
 function New-Row {
     param($t, [bool]$isProject)
@@ -517,6 +557,7 @@ function New-Row {
     $closedOn = Format-D (Get-Val $t 'dateclosed')
     $isClosed = ($name -match '^(Closed|Resolved|Cancelled|Completed)') -or ($closedOn -ne '')
     return @{
+        state     = Get-TaskState $name $isClosed
         id        = [int](Get-Val $t 'id')
         summary   = [string](Get-Val $t 'summary')
         agent     = Agent-Name (Get-Val $t 'agent_id')
@@ -538,13 +579,15 @@ function New-Row {
 }
 
 function Get-Flags {
+    # Broken DATA only. Being late is a delivery problem, not a data problem,
+    # and it is handled by the risk machinery below - flagging it here as well
+    # only meant the same task was reported twice in two different voices.
     param($r)
     $f = @()
     if ($r.closed) { return $f }
     if (-not $r.start)  { $f += 'no start' }
     if (-not $r.target) { $f += 'no end' }
     if ($r.start -and $r.target -and $r.target -lt $r.start) { $f += 'end before start' }
-    if ($r.target -and $r.target -lt $today) { $f += 'overdue' }
     return $f
 }
 
@@ -580,17 +623,90 @@ foreach ($k in $tasks) {
     $d = 1.0
     $a = To-Date $k.start
     $b = To-Date $k.target
-    if ($null -ne $a -and $null -ne $b -and $b -ge $a) { $d = ($b - $a).TotalDays + 1 }
+    $k.hasWindow = ($null -ne $a -and $null -ne $b -and $b -ge $a)
+    if ($k.hasWindow) { $d = ($b - $a).TotalDays + 1 }
     $k.days = [Math]::Max(1.0, $d)
+}
+
+# --- risk, task by task ----------------------------------------------------
+# This is the point of the weighting. A task is judged against its OWN window,
+# not the project's: three days left on a three-day task is business as usual,
+# three days left on a forty-day task nobody has started is the thing you want
+# to hear about. The absolute-days test is the floor underneath that, so a
+# short task still gets a warning before it lands rather than after.
+function Get-TaskRisk {
+    param($k)
+    $r = @{ level='ok'; why=''; daysLeft=$null; ownPct=-1 }
+    if ($k.closed) { $r.level = 'done'; return $r }
+    if (-not $k.target) {
+        $r.level = 'unknown'
+        $r.why   = 'no end date, so there is nothing to judge it against'
+        return $r
+    }
+    $t = To-Date $k.target
+    $r.daysLeft = [int](($t - $nowD).TotalDays)
+    if ($k.hasWindow) {
+        $s = To-Date $k.start
+        $span = ($t - $s).TotalDays
+        if ($span -gt 0) {
+            $r.ownPct = [int][Math]::Round((($nowD - $s).TotalDays / $span) * 100)
+            if ($r.ownPct -lt 0) { $r.ownPct = 0 }
+        }
+    }
+    $word = 'in progress'
+    if ($k.state -eq 'new')  { $word = 'not started' }
+    if ($k.state -eq 'hold') { $word = 'on hold' }
+
+    if ($r.daysLeft -lt 0) {
+        $r.level = 'late'
+        $r.why   = "$([Math]::Abs($r.daysLeft)) day(s) past its end date, $word"
+        return $r
+    }
+    # closing in: either a big share of its own window has gone, or the end
+    # date is simply upon us
+    if (-not (($r.daysLeft -le $NearEndDays) -or ($r.ownPct -ge $NearEndPct))) { return $r }
+
+    $left = "$($r.daysLeft) day(s) left"
+    if ($k.hasWindow)      { $left = "$($r.daysLeft) of its $([int]$k.days) days left" }
+    if ($r.daysLeft -eq 0) { $left = 'due today' }
+    if ($k.state -eq 'progress') {
+        # somebody is on it - worth a mention, not worth a colour
+        $r.level = 'watch'
+        $r.why   = "$left, in progress"
+    } else {
+        $r.level = 'atrisk'
+        $r.why   = "$left, $word"
+    }
+    return $r
+}
+foreach ($k in $tasks) {
+    $r = Get-TaskRisk $k
+    $k.risk     = $r.level
+    $k.riskWhy  = $r.why
+    $k.daysLeft = $r.daysLeft
+    $k.ownPct   = $r.ownPct
 }
 
 $totTask  = $tasks.Count
 $closedT  = @($tasks | Where-Object { $_.closed })
 $openT    = @($tasks | Where-Object { -not $_.closed })
-$overdueT = @($openT | Where-Object { $_.target -and $_.target -lt $today })
-$dueSoonT = @($openT | Where-Object { $_.target -and $_.target -ge $today -and $_.target -le $soonIso })
+$lateT    = @($tasks | Where-Object { $_.risk -eq 'late' })
+$atRiskT  = @($tasks | Where-Object { $_.risk -eq 'atrisk' })
+$watchT   = @($tasks | Where-Object { $_.risk -eq 'watch' })
+$unknownT = @($tasks | Where-Object { $_.risk -eq 'unknown' })
+$inProgT  = @($openT | Where-Object { $_.state -eq 'progress' })
+$onHoldT  = @($openT | Where-Object { $_.state -eq 'hold' })
+$newT     = @($openT | Where-Object { $_.state -eq 'new' })
+$dueSoonT = @($openT | Where-Object { $_.risk -eq 'ok' -and $null -ne $_.daysLeft -and $_.daysLeft -le $DueSoonDays })
 $unsched  = @($openT | Where-Object { -not $_.start -or -not $_.target })
 $noOwner  = @($openT | Where-Object { $_.agent -eq 'Unassigned' })
+
+# how much of the remaining work is simply invisible to the risk test
+$unknownDays = 0.0; $openDays = 0.0
+foreach ($k in $unknownT) { $unknownDays += $k.days }
+foreach ($k in $openT)    { $openDays    += $k.days }
+$unknownShare = 0
+if ($openDays -gt 0) { $unknownShare = [int][Math]::Round($unknownDays / $openDays * 100) }
 
 $sumDays = 0.0; $doneDays = 0.0
 foreach ($k in $tasks) { $sumDays += $k.days; if ($k.closed) { $doneDays += $k.days } }
@@ -645,7 +761,32 @@ if ($null -ne $ad -and $null -ne $bd -and $bd -ge $ad) {
 # meaning on its own - the word and the reasons do - so it survives being
 # printed in black and white, or read by someone who does not see red and
 # green apart.
-$rag = 'green'; $ragWord = 'Green'; $reasons = @()
+#
+# What does NOT set the colour: the headline completion figure. Work closed
+# against time elapsed is worth showing, and it is shown, but it condemns a
+# project whose remaining tasks are all under way and on time, which is not a
+# project in trouble. Tasks decide the colour:
+#
+#   red    something is already past its end date
+#   amber  something is running out of its window and nobody has picked it up
+#   green  everything open is either in hand, or not yet near its end date
+#
+# Data-quality gripes - no dates, nobody assigned - are listed separately and
+# deliberately do not move the colour. They are housekeeping, not delivery.
+
+function Get-RiskBullets {
+    param($Rows, [int]$Show = 3, [string]$More = 'more')
+    $out = @(); $i = 0
+    foreach ($r in @($Rows | Sort-Object @{Expression={$_.target}})) {
+        $i++
+        if ($i -gt $Show) { break }
+        $out += ($r.summary + ' (#' + $r.id + ') - ' + $r.riskWhy)
+    }
+    if ($Rows.Count -gt $Show) { $out += ('and ' + ($Rows.Count - $Show) + ' ' + $More) }
+    return $out
+}
+
+$rag = 'green'; $ragWord = 'Green'; $reasons = @(); $notes = @()
 
 if ($P.closed) {
     $rag = 'done'; $ragWord = 'Complete'
@@ -657,62 +798,87 @@ if ($P.closed) {
 }
 elseif ($totTask -eq 0) {
     $rag = 'amber'; $ragWord = 'Amber'
-    $reasons += 'The project has no tasks, so there is nothing to measure progress against'
+    $reasons += 'The project has no tasks, so there is nothing to judge'
     if ($effTarget -and $effTarget -lt $today) {
         $rag = 'red'; $ragWord = 'Red'
         $reasons += "The project record is past its end date ($(Show-D $effTarget))"
     }
 }
-elseif ($pctDays -ge 100) {
+elseif ($openT.Count -eq 0) {
     $rag = 'green'; $ragWord = 'Green'
     $reasons += 'Every task is closed - the project record itself has not been closed yet'
 }
 else {
-    $behind = -1
-    if ($elapsed -ge 0) { $behind = $elapsed - $pctDays }
-
-    if ($effTarget -and $effTarget -lt $today) {
-        $rag = 'red'; $ragWord = 'Red'
-        $reasons += "Past its end date ($(Show-D $effTarget)) with $($openT.Count) task(s) still open"
+    if ($lateT.Count -gt 0) {
+        $lateUnworked = @($lateT | Where-Object { $_.state -ne 'progress' })
+        if ($LateInProgressIsRed -or $lateUnworked.Count -gt 0) { $rag = 'red';   $ragWord = 'Red' }
+        else                                                    { $rag = 'amber'; $ragWord = 'Amber' }
+        $reasons += (Get-RiskBullets $lateT 3 'more past their end date')
     }
-    if ($behind -ge $RedBehindBy) {
+    elseif ($effTarget -and $effTarget -lt $today) {
+        # only reachable when the open work carries no dates of its own
         $rag = 'red'; $ragWord = 'Red'
-        $reasons += "$behind points behind schedule - $pctDays% of the work done against $elapsed% of the time gone"
+        $reasons += "The project is past its end date ($(Show-D $effTarget)) with $($openT.Count) task(s) still open"
     }
-    elseif ($behind -ge $AmberBehindBy) {
+    if ($atRiskT.Count -gt 0) {
         if ($rag -ne 'red') { $rag = 'amber'; $ragWord = 'Amber' }
-        $reasons += "$behind points behind schedule - $pctDays% of the work done against $elapsed% of the time gone"
+        $reasons += (Get-RiskBullets $atRiskT 3 'more running out of time')
     }
-    if ($overdueT.Count -gt 0) {
+    if ($unknownT.Count -gt 0 -and $unknownShare -ge 50) {
         if ($rag -eq 'green') { $rag = 'amber'; $ragWord = 'Amber' }
-        $reasons += "$($overdueT.Count) open task(s) are past their end date"
+        $reasons += ("$($unknownT.Count) open task(s) have no end date and account for $unknownShare% of " +
+                     'the work left, so there is not enough in Halo to call this one')
     }
-    if ($elapsed -lt 0) {
-        if ($rag -eq 'green') { $rag = 'amber'; $ragWord = 'Amber' }
-        $reasons += 'There is no usable schedule to judge the progress against'
-    }
-    if ($unsched.Count -gt 0) {
-        if ($rag -eq 'green') { $rag = 'amber'; $ragWord = 'Amber' }
-        $reasons += "$($unsched.Count) open task(s) have no start or no end date"
-    }
-    if ($noOwner.Count -gt 0) {
-        if ($rag -eq 'green') { $rag = 'amber'; $ragWord = 'Amber' }
-        $reasons += "$($noOwner.Count) open task(s) have nobody assigned"
-    }
-    if ($reasons.Count -eq 0) {
-        $reasons += "On track - $pctDays% of the work done against $elapsed% of the time gone"
+    if ($rag -eq 'green') {
+        $bits = @()
+        if ($inProgT.Count -gt 0) { $bits += "$($inProgT.Count) in progress" }
+        if ($newT.Count -gt 0)    { $bits += "$($newT.Count) not started but not yet near its end date" }
+        $reasons += ("Nothing is late and nothing is running out of time" +
+                     $(if ($bits.Count -gt 0) { ' - ' + ($bits -join ', ') } else { '' }))
         if ($effTarget -and $leftDays -ge 0) { $reasons += "$leftDays day(s) left to $(Show-D $effTarget)" }
     }
+    if ($watchT.Count -gt 0) {
+        $reasons += ("$($watchT.Count) task(s) are close to their end date but in progress" +
+                     ' - worth a word at the next catch-up rather than an escalation')
+    }
 }
+
+# housekeeping - said out loud, kept out of the verdict
+if ($unsched.Count -gt 0) { $notes += "$($unsched.Count) open task(s) have no start or no end date" }
+if ($noOwner.Count -gt 0) { $notes += "$($noOwner.Count) open task(s) have nobody assigned" }
+if ($onHoldT.Count -gt 0) { $notes += "$($onHoldT.Count) open task(s) are on hold or waiting on somebody" }
+
 Say "  RAG: $ragWord" $(if ($rag -eq 'red') { 'Red' } elseif ($rag -eq 'amber') { 'Yellow' } else { 'Green' })
 foreach ($r in $reasons) { Say "    - $r" 'DarkGray' }
+foreach ($r in $notes)   { Say "    . $r (not part of the verdict)" 'DarkGray' }
+
+# --- how the statuses were read --------------------------------------------
+# The verdict leans on "is anybody doing this", so the mapping has to be
+# visible. An unlisted status defaults to in progress, which is the quiet
+# option - but quiet is only right if it is also correct, so say so.
+$stateOfStatus = @{}
+foreach ($k in $tasks) { if (-not $stateOfStatus.ContainsKey($k.status)) { $stateOfStatus[$k.status] = $k.state } }
+$stateWordOf = @{ closed='closed'; progress='in progress'; new='not started'; hold='on hold' }
+$unlisted = @()
+foreach ($s in @($stateOfStatus.Keys | Sort-Object)) {
+    if ($stateOfStatus[$s] -eq 'progress' -and -not (Test-StatusListed $s)) { $unlisted += $s }
+}
+if ($stateOfStatus.Count -gt 0) {
+    Say ("  statuses seen: " + (@($stateOfStatus.Keys | Sort-Object |
+         ForEach-Object { $_ + ' -> ' + $stateWordOf[$stateOfStatus[$_]] }) -join ', ')) 'DarkGray'
+}
+if ($unlisted.Count -gt 0) {
+    Say ("  assumed to mean in progress: " + ($unlisted -join ', ')) 'Yellow'
+    Say '  if any of those really mean not-started or on-hold, add them to $NotStartedStatuses' 'Yellow'
+    Say '  or $OnHoldStatuses at the top and run again - the verdict depends on it.' 'Yellow'
+}
 
 # --- per-agent -------------------------------------------------------------
 $byAgent = @{}
 function Touch-Agent {
     param([string]$a)
     if (-not $byAgent.ContainsKey($a)) {
-        $byAgent[$a] = @{ open=0; closed=0; overdue=0; days=0.0; doneDays=0.0; next='' }
+        $byAgent[$a] = @{ open=0; closed=0; late=0; atrisk=0; days=0.0; doneDays=0.0; next='' }
     }
 }
 Touch-Agent $P.agent
@@ -723,7 +889,8 @@ foreach ($k in $tasks) {
     if ($k.closed) { $e.closed++; $e.doneDays += $k.days }
     else {
         $e.open++
-        if ($k.target -and $k.target -lt $today) { $e.overdue++ }
+        if ($k.risk -eq 'late')   { $e.late++ }
+        if ($k.risk -eq 'atrisk') { $e.atrisk++ }
         if ($k.target -and ((-not $e.next) -or $k.target -lt $e.next)) { $e.next = $k.target }
     }
 }
@@ -748,7 +915,8 @@ foreach ($m in $milestones) {
     foreach ($k in $kids) { $md += $k.days; if ($k.closed) { $mdone += $k.days } }
     $m.pct = 0
     if ($md -gt 0) { $m.pct = [int][Math]::Round($mdone / $md * 100) }
-    $m.overdue = @($kids | Where-Object { -not $_.closed -and $_.target -and $_.target -lt $today }).Count
+    $m.late   = @($kids | Where-Object { $_.risk -eq 'late' }).Count
+    $m.atRisk = @($kids | Where-Object { $_.risk -eq 'atrisk' }).Count
 }
 $unMs = @($tasks | Where-Object { $_.milestone -le 0 -or -not $msName.ContainsKey($_.milestone) })
 
@@ -906,6 +1074,9 @@ p{margin:0 0 12px;max-width:80ch}
 .ragline{font-size:15.5px;font-weight:650}
 .rag ul{margin:11px 0 0;padding-left:20px;font-size:13.5px;color:var(--text-secondary)}
 .rag li{margin:3px 0}
+.ragnote{margin:13px 0 0;padding-top:10px;border-top:1px solid var(--ring);
+ font-size:12.5px;color:var(--text-secondary)}
+.ragnote b{font-weight:600}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:11px;margin-bottom:16px}
 .tile{background:var(--surface-1);border:1px solid var(--ring);border-radius:11px;padding:13px 15px}
 .tile b{display:block;font-size:25px;line-height:1.05;letter-spacing:-.02em;font-weight:600}
@@ -954,9 +1125,15 @@ td.ax span{position:absolute;bottom:3px;transform:translateX(-50%);white-space:n
  padding:2px 6px;border-radius:99px;border:1px solid;white-space:nowrap;margin-left:5px;
  display:inline-block}
 .f-bad{color:var(--critical);border-color:var(--critical)}
+.f-warn{color:var(--r-amber);border-color:var(--r-amber)}
 .f-mut{color:var(--text-secondary);border-color:var(--axis)}
 .f-ok{color:var(--good);border-color:var(--good)}
+.why{color:var(--text-secondary);font-size:12.5px}
 .desc{font-size:13.5px;color:var(--text-secondary);max-width:92ch;white-space:pre-wrap}
+/* the task table is genuinely wide - let it scroll inside its own card rather
+   than dragging the whole page sideways on a laptop or a phone */
+.scrollx{overflow-x:auto}
+.scrollx table{min-width:840px}
 .bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;position:sticky;top:0;z-index:30;
  background:var(--plane);padding:11px 0;margin-bottom:8px;border-bottom:1px solid var(--grid)}
 .bar label{font-size:13px;display:flex;align-items:center;gap:6px;cursor:pointer;white-space:nowrap}
@@ -974,6 +1151,8 @@ button:hover{color:var(--text-primary)}
  body{background:#fff}
  tr{break-inside:avoid}
  .rag{border-width:2px}
+ .scrollx{overflow:visible}
+ .scrollx table{min-width:0}
 }
 @media (max-width:760px){.kv{gap:6px 16px}}
 </style>
@@ -983,17 +1162,21 @@ $js = @'
 <script>
 (function(){
  var q=document.getElementById('fq'), ag=document.getElementById('fagent'),
-     sc=document.getElementById('fclosed'), pr=document.getElementById('fprob'),
+     sc=document.getElementById('fclosed'), rk=document.getElementById('frisk'),
      cnt=document.getElementById('fcount'), pb=document.getElementById('pbtn');
  var rows=[].slice.call(document.querySelectorAll('tr.task'));
+ var ATTN={late:1,atrisk:1,watch:1,unknown:1};
  function apply(){
   var term=q.value.trim().toLowerCase(), a=ag.value,
-      showClosed=sc.checked, onlyProb=pr.checked, shown=0;
+      showClosed=sc.checked, want=rk.value, shown=0;
   rows.forEach(function(r){
-   var ok=true;
+   var ok=true, risk=r.dataset.risk;
    if(!showClosed && r.dataset.closed==='1') ok=false;
    if(a && r.dataset.agent!==a) ok=false;
-   if(onlyProb && r.dataset.prob!=='1') ok=false;
+   if(want==='prob' && r.dataset.prob!=='1') ok=false;
+   if(want==='late' && risk!=='late') ok=false;
+   if(want==='risk' && !(risk==='late'||risk==='atrisk')) ok=false;
+   if(want==='attn' && !ATTN[risk]) ok=false;
    if(term && r.dataset.q.indexOf(term)<0) ok=false;
    r.classList.toggle('hidden',!ok); if(ok) shown++;
   });
@@ -1008,12 +1191,11 @@ $js = @'
    g.classList.toggle('hidden',!any);
   });
  }
- [sc,pr].forEach(function(e){e.addEventListener('change',apply)});
- ag.addEventListener('change',apply);
+ [sc,rk,ag].forEach(function(e){e.addEventListener('change',apply)});
  q.addEventListener('input',apply);
  // print the whole plan, not whatever happens to be filtered on screen
  if(pb) pb.addEventListener('click',function(){
-  sc.checked=true; pr.checked=false; ag.value=''; q.value=''; apply(); window.print();
+  sc.checked=true; rk.value=''; ag.value=''; q.value=''; apply(); window.print();
  });
  document.getElementById('totop').addEventListener('click',function(){
   window.scrollTo({top:0,behavior:'smooth'});
@@ -1066,7 +1248,12 @@ W ('<div class="ragtop"><span class="ragbadge">' + (Esc $ragWord) + '</span>' +
    '<span class="ragline">' + (Esc $ragBlurb) + '</span></div>')
 W '<ul>'
 foreach ($r in $reasons) { W ('<li>' + (Esc $r) + '</li>') }
-W '</ul></div>'
+W '</ul>'
+if ($notes.Count -gt 0) {
+    W ('<p class="ragnote"><b>Housekeeping, and deliberately not part of the verdict:</b> ' +
+       (Esc ($notes -join '; ')) + '.</p>')
+}
+W '</div>'
 
 # --- progress --------------------------------------------------------------
 W '<div class="card"><h3>Progress</h3>'
@@ -1100,13 +1287,15 @@ if ($elapsed -ge 0) {
     W '</div>'
     $gap = $elapsed - $pctDays
     $verdict = 'level with the schedule'
-    if ($gap -ge $AmberBehindBy)     { $verdict = "$gap points behind the schedule" }
-    elseif ($gap -gt 0)              { $verdict = "$gap points behind, which is within tolerance" }
-    elseif ($gap -lt 0)              { $verdict = "$([Math]::Abs($gap)) points ahead of the schedule" }
+    if ($gap -gt 0)    { $verdict = "$gap points behind the schedule" }
+    elseif ($gap -lt 0) { $verdict = "$([Math]::Abs($gap)) points ahead of the schedule" }
     $leftTxt = "$leftDays day(s) left"
     if ($leftDays -lt 0) { $leftTxt = "$([Math]::Abs($leftDays)) day(s) past the end date" }
+    # said as an observation, not a verdict - the RAG above is decided on the
+    # tasks, and a project can sit well behind this line and be perfectly well
     W ('<p class="sub" style="margin:14px 0 0">A ' + $spanDays + ' day project: ' + $goneDays + ' gone, ' +
-       $leftTxt + '. The work is ' + (Esc $verdict) + '.</p>')
+       $leftTxt + '. The work is ' + (Esc $verdict) + ', which is context rather than a verdict &mdash; ' +
+       'a project loaded with long tasks that are all under way will read behind this line and still land.</p>')
 } else {
     W ('<p class="sub" style="margin:14px 0 0">Neither this project nor its tasks carry a usable ' +
        'start-and-end window, so there is no schedule to measure the work against.</p>')
@@ -1116,14 +1305,15 @@ W '</div>'
 # --- tiles -----------------------------------------------------------------
 W '<div class="tiles">'
 $tiles = @(
-    @{v=$totTask;          l='Tasks';                      w=$false},
-    @{v=$openT.Count;      l='Open';                       w=$false},
-    @{v=$closedT.Count;    l='Closed';                     w=$false},
-    @{v=$overdueT.Count;   l='Overdue';                    w=($overdueT.Count -gt 0)},
-    @{v=$dueSoonT.Count;   l=("Due in $DueSoonDays days"); w=$false},
-    @{v=$milestones.Count; l='Milestones';                 w=$false},
-    @{v=$agentOrder.Count; l='People assigned';            w=$false},
-    @{v=$unsched.Count;    l='Open, no dates';             w=($unsched.Count -gt 0)}
+    @{v=$totTask;          l='Tasks';          w=$false},
+    @{v=$closedT.Count;    l='Closed';         w=$false},
+    @{v=$inProgT.Count;    l='In progress';    w=$false},
+    @{v=$newT.Count;       l='Not started';    w=$false},
+    @{v=$onHoldT.Count;    l='On hold';        w=$false},
+    @{v=$lateT.Count;      l='Late';           w=($lateT.Count -gt 0)},
+    @{v=$atRiskT.Count;    l='At risk';        w=($atRiskT.Count -gt 0)},
+    @{v=$watchT.Count;     l='Closing in';     w=$false},
+    @{v=$unknownT.Count;   l='No end date';    w=$false}
 )
 foreach ($t in $tiles) {
     W ('<div class="tile' + $(if ($t.w) { ' warn' } else { '' }) + '"><b>' + $t.v + '</b><span>' +
@@ -1142,9 +1332,10 @@ if ($P.details) {
 
 # --- the people ------------------------------------------------------------
 W '<h2>Who is assigned</h2><div class="card">'
-W '<table><thead><tr><th>Person</th><th class="n" style="width:66px">Open</th>'
-W '<th class="n" style="width:74px">Closed</th><th class="n" style="width:80px">Overdue</th>'
-W '<th style="width:190px">Their share done</th><th style="width:120px">Next due</th></tr></thead><tbody>'
+W '<table><thead><tr><th>Person</th><th class="n" style="width:62px">Open</th>'
+W '<th class="n" style="width:70px">Closed</th><th class="n" style="width:66px">Late</th>'
+W '<th class="n" style="width:76px">At risk</th>'
+W '<th style="width:174px">Their share done</th><th style="width:112px">Next due</th></tr></thead><tbody>'
 foreach ($a in $agentOrder) {
     $e = $byAgent[$a]
     if (($e.open + $e.closed) -eq 0 -and $a -ne $P.agent) { continue }
@@ -1154,7 +1345,8 @@ foreach ($a in $agentOrder) {
     if ($a -eq $P.agent) { $who += '<span class="flag f-mut">project manager</span>' }
     W ('<tr><td><span class="dot" style="background:var(--s' + $slotOf[$a] + ')"></span>' + $who + '</td>')
     W ('<td class="n">' + $e.open + '</td><td class="n">' + $e.closed + '</td>')
-    W ('<td class="n">' + $(if ($e.overdue -gt 0) { '<span class="flag f-bad">' + $e.overdue + '</span>' } else { '0' }) + '</td>')
+    W ('<td class="n">' + $(if ($e.late   -gt 0) { '<span class="flag f-bad" style="margin-left:0">'  + $e.late   + '</span>' } else { '0' }) + '</td>')
+    W ('<td class="n">' + $(if ($e.atrisk -gt 0) { '<span class="flag f-warn" style="margin-left:0">' + $e.atrisk + '</span>' } else { '0' }) + '</td>')
     if (($e.open + $e.closed) -gt 0) {
         W ('<td><span class="meter"><b style="width:' + $ap + '%"></b></span><span class="pct">' + $ap + '%</span></td>')
     } else {
@@ -1174,8 +1366,11 @@ if ($milestones.Count -gt 0) {
     foreach ($m in @($milestones | Sort-Object @{Expression={$_.seq}}, @{Expression={$_.start}})) {
         W '<tr>'
         $tag = ''
-        if ($m.overdue -gt 0) { $tag = '<span class="flag f-bad">' + $m.overdue + ' overdue</span>' }
-        elseif ($m.taskCount -gt 0 -and $m.doneCount -eq $m.taskCount) { $tag = '<span class="flag f-ok">complete</span>' }
+        if ($m.late   -gt 0) { $tag += '<span class="flag f-bad">'  + $m.late   + ' late</span>' }
+        if ($m.atRisk -gt 0) { $tag += '<span class="flag f-warn">' + $m.atRisk + ' at risk</span>' }
+        if (-not $tag -and $m.taskCount -gt 0 -and $m.doneCount -eq $m.taskCount) {
+            $tag = '<span class="flag f-ok">complete</span>'
+        }
         W ('<td><b>' + (Esc $m.name) + '</b>' + $tag + '</td>')
         W ('<td class="n">' + $m.doneCount + ' / ' + $m.taskCount + '</td>')
         if ($m.taskCount -gt 0) {
@@ -1198,22 +1393,44 @@ if ($milestones.Count -gt 0) {
 }
 
 # --- needs attention -------------------------------------------------------
-if ($overdueT.Count -gt 0 -or $dueSoonT.Count -gt 0) {
-    W '<h2>What needs attention</h2><div class="card"><table>'
-    W '<thead><tr><th style="width:132px">When</th><th style="width:56px">ID</th><th>Task</th>'
-    W '<th style="width:140px">Owner</th><th class="d" style="width:100px">Due</th></tr></thead><tbody>'
-    foreach ($k in @($overdueT | Sort-Object @{Expression={$_.target}})) {
-        $late = [int]((To-Date $today) - (To-Date $k.target)).TotalDays
-        W ('<tr><td><span class="flag f-bad" style="margin-left:0">' + $late + ' day(s) late</span></td>' +
-           '<td class="mono">' + $k.id + '</td><td>' + (Esc $k.summary) + '</td>' +
-           '<td class="d">' + (Esc $k.agent) + '</td><td class="d">' + (Show-D $k.target) + '</td></tr>')
+# Ordered by how much it matters, not by date: what is already late, then what
+# is running out of time unattended, then what is close but in hand, then what
+# is merely coming up. The "why" column is the whole point - "45 day task, 3
+# days left, not started" is an instruction, where "due Friday" is a diary note.
+function Get-RiskBadge {
+    param([string]$level)
+    switch ($level) {
+        'late'   { return '<span class="flag f-bad"  style="margin-left:0">late</span>' }
+        'atrisk' { return '<span class="flag f-warn" style="margin-left:0">at risk</span>' }
+        'watch'  { return '<span class="flag f-mut"  style="margin-left:0">closing in</span>' }
+        'ok'     { return '<span class="flag f-mut"  style="margin-left:0">due soon</span>' }
+        default  { return '' }
     }
-    foreach ($k in @($dueSoonT | Sort-Object @{Expression={$_.target}})) {
-        $inD = [int]((To-Date $k.target) - (To-Date $today)).TotalDays
-        $when = 'in ' + $inD + ' day(s)'
-        if ($inD -eq 0) { $when = 'today' }
-        W ('<tr><td><span class="flag f-mut" style="margin-left:0">' + $when + '</span></td>' +
-           '<td class="mono">' + $k.id + '</td><td>' + (Esc $k.summary) + '</td>' +
+}
+$attn = @()
+$attn += @($lateT    | Sort-Object @{Expression={$_.target}})
+$attn += @($atRiskT  | Sort-Object @{Expression={$_.target}})
+$attn += @($watchT   | Sort-Object @{Expression={$_.target}})
+$attn += @($dueSoonT | Sort-Object @{Expression={$_.target}})
+if ($attn.Count -gt 0) {
+    W ('<h2>What needs attention</h2><div class="card">')
+    W ('<p class="sub" style="margin:0 0 12px">Each task judged against its own window, so a long ' +
+       'task with a little time left ranks above a short one with the same days on the clock.</p>')
+    W '<table><thead><tr><th style="width:86px">Risk</th><th style="width:54px">ID</th><th>Task</th>'
+    W '<th style="width:32%">Why</th><th style="width:124px">Owner</th>'
+    W '<th class="d" style="width:94px">End</th></tr></thead><tbody>'
+    foreach ($k in $attn) {
+        $why = $k.riskWhy
+        if (-not $why) {
+            $why = "$($k.daysLeft) day(s) to its end date"
+            if ($k.daysLeft -eq 0) { $why = 'due today' }
+            $sw = 'in progress'
+            if ($k.state -eq 'new')  { $sw = 'not started' }
+            if ($k.state -eq 'hold') { $sw = 'on hold' }
+            $why += ", $sw"
+        }
+        W ('<tr><td>' + (Get-RiskBadge $k.risk) + '</td><td class="mono">' + $k.id + '</td>' +
+           '<td>' + (Esc $k.summary) + '</td><td class="why">' + (Esc $why) + '</td>' +
            '<td class="d">' + (Esc $k.agent) + '</td><td class="d">' + (Show-D $k.target) + '</td></tr>')
     }
     W '</tbody></table></div>'
@@ -1247,7 +1464,13 @@ W '</div>'
 W '<h2>Tasks</h2>'
 W '<div class="bar">'
 W '<label><input type="checkbox" id="fclosed" checked> Closed tasks</label>'
-W '<label><input type="checkbox" id="fprob"> Only date problems</label>'
+W '<label>Show <select id="frisk">'
+W '<option value="">every task</option>'
+W '<option value="late">late only</option>'
+W '<option value="risk">late or at risk</option>'
+W '<option value="attn">anything needing attention</option>'
+W '<option value="prob">date problems</option>'
+W '</select></label>'
 W '<label>Owner <select id="fagent"><option value="">everyone</option>'
 foreach ($a in $agentOrder) {
     if (($byAgent[$a].open + $byAgent[$a].closed) -eq 0) { continue }
@@ -1259,7 +1482,7 @@ W '<button id="pbtn">Print / save as PDF</button>'
 W '<span id="fcount" class="pid" style="margin-left:auto"></span>'
 W '</div>'
 
-W '<div class="card" style="padding:12px 16px">'
+W '<div class="card scrollx" style="padding:12px 16px">'
 if ($totTask -eq 0) {
     W '<p style="margin:0" class="sub">This project has no tasks attached to it in Halo, so there is nothing to list.</p>'
 } else {
@@ -1297,10 +1520,18 @@ if ($totTask -eq 0) {
             if ($k.closed) { $rc += ' done' }
             W ('<tr class="' + $rc + '" data-closed="' + $(if ($k.closed) { 1 } else { 0 }) +
                '" data-prob="' + $(if ($k.flags.Count -gt 0) { 1 } else { 0 }) +
+               '" data-risk="' + $k.risk +
                '" data-agent="' + (Esc $k.agent) +
                '" data-q="' + (Esc (($k.summary + ' ' + $k.agent + ' ' + $k.status + ' ' + $k.id).ToLower())) + '">')
             W ('<td class="mono">' + $k.id + '</td>')
             W ('<td>' + (Esc $k.summary))
+            # the badge carries its own reason in the tooltip, so the row stays
+            # narrow but the detail is a hover away
+            if ($k.risk -eq 'late' -or $k.risk -eq 'atrisk' -or $k.risk -eq 'watch') {
+                $b = Get-RiskBadge $k.risk
+                $b = $b -replace 'style="margin-left:0"', ('title="' + (Esc $k.riskWhy) + '"')
+                W $b
+            }
             if ($k.flags.Count -gt 0) { W ('<span class="flag f-bad">' + (Esc ($k.flags -join ', ')) + '</span>') }
             W '</td>'
             W ('<td class="d">' + (Esc $k.agent) + '</td>')
@@ -1327,11 +1558,39 @@ if ($totTask -eq 0) {
 }
 W '</div>'
 
-W ('<p class="lede" style="margin-top:24px">Progress counts closed tasks weighted by each task&rsquo;s length in days, ' +
-   'so a three-week task carries more than a half-day one; a task with no usable window counts as a single day. ' +
-   'The RAG verdict compares that figure with how much of the schedule has elapsed - ' + $AmberBehindBy +
-   ' points behind is amber, ' + $RedBehindBy + ' is red - and every reason behind it is listed in full above. ' +
-   'Generated ' + (Esc $stamp) + ' from Halo ticket #' + $P.id + '.</p>')
+W '<h2>How this was judged</h2><div class="card">'
+W ('<p style="margin:0 0 10px"><b>The colour comes from the tasks, one at a time.</b> ' +
+   'Each open task is measured against its own window rather than the project&rsquo;s, so a task counts as ' +
+   '<i>closing in</i> once ' + $NearEndPct + '% of its own span has gone, or when it is within ' + $NearEndDays +
+   ' day(s) of its end date &mdash; whichever comes first. That way a ' + $NearEndDays +
+   '-day gap means something different on a six-week task than on a three-day one.</p>')
+W '<ul style="margin:0 0 12px;padding-left:20px;font-size:13.5px;color:var(--text-secondary)">'
+W ('<li><b>Red</b> &mdash; something is already past its end date' +
+   $(if ($LateInProgressIsRed) { ', whether or not anybody is working it' }
+     else { ' and nobody is working it; a late task in progress is amber on this report' }) + '.</li>')
+W '<li><b>Amber</b> &mdash; something is closing in and nobody has picked it up: not started, or on hold.</li>'
+W '<li><b>Green</b> &mdash; everything open is either in progress, or not yet near its end date. A task that is closing in but in progress is listed, not punished.</li>'
+W '</ul>'
+W ('<p style="margin:0 0 10px">The completion figure above &mdash; closed tasks weighted by each one&rsquo;s length in days, ' +
+   'so a three-week task carries more than a half-day one &mdash; is shown as context and does <b>not</b> set the colour. ' +
+   'A project whose remaining work is long and under way will always read behind a straight burn-up line without being in any trouble. ' +
+   'Missing dates and unassigned tasks are listed as housekeeping and do not set the colour either, ' +
+   'unless tasks with no end date account for half or more of the work left &mdash; at which point there is not enough in Halo to judge.</p>')
+if ($stateOfStatus.Count -gt 0) {
+    $mapBits = @()
+    foreach ($s in @($stateOfStatus.Keys | Sort-Object)) {
+        $bit = (Esc $s) + ' &rarr; ' + $stateWordOf[$stateOfStatus[$s]]
+        if ($stateOfStatus[$s] -eq 'progress' -and -not (Test-StatusListed $s)) { $bit += ' (assumed)' }
+        $mapBits += $bit
+    }
+    W ('<p style="margin:0 0 10px"><b>Statuses were read as:</b> ' + ($mapBits -join ' &middot; ') + '. ' +
+       'Anything marked <i>assumed</i> was not in the script&rsquo;s status lists and was taken to be in progress, ' +
+       'which is the option that never invents a problem &mdash; if one of those really means not-started or ' +
+       'on-hold, it belongs in <code>$NotStartedStatuses</code> or <code>$OnHoldStatuses</code> at the top of the script.</p>')
+}
+W ('<p style="margin:0" class="sub">Generated ' + (Esc $stamp) + ' from Halo ticket #' + $P.id +
+   '. Read-only &mdash; nothing was changed in Halo.</p>')
+W '</div>'
 
 W '<button class="top" id="totop">Back to top</button>'
 W $js
