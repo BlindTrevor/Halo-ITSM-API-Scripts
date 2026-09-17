@@ -14,6 +14,11 @@ press F5.
 | [`New-HaloProject.ps1`](New-HaloProject.ps1) | **writes** | Creates one project and its tasks from a table you fill in. |
 | [`New-HaloProjectReport.ps1`](New-HaloProjectReport.ps1) | read-only | HTML report across *every* project in the tenant. |
 | [`New-HaloProjectStatusReport.ps1`](New-HaloProjectStatusReport.ps1) | read-only | HTML status report for *one* project. |
+| [`New-HaloProjectPortfolioReport.ps1`](New-HaloProjectPortfolioReport.ps1) | read-only | Both of the above in one file: every project, click one to drill into it. |
+
+If you are running a project meeting from a single document, use
+`New-HaloProjectPortfolioReport.ps1` and ignore the other two reports — it is
+what they produce, merged, with the drill-down wired up.
 
 ## Configuration
 
@@ -37,7 +42,7 @@ them:
 | `--- Your tenant's ids` | The project and task ticket type ids. |
 | *script-specific* | What goes in the report, which project, the project and its tasks. |
 | `--- Agents who have left` | `$FormerAgents`, `$FormerSuffix` (reports only). |
-| `--- How the RAG verdict is judged` | Thresholds and status-name lists (status report only). |
+| `--- How the RAG verdict is judged` | Thresholds and status-name lists (the status and portfolio reports). |
 | `--- Advanced` | `$PAGE`, the API page size. Rarely touched. |
 
 The variables you are most likely to change, per script:
@@ -47,6 +52,7 @@ The variables you are most likely to change, per script:
 | `New-HaloProject.ps1` | `$Apply`, `$ProjectTypeId`, `$TaskTypeId`, `$PriorityMap`, `$AgentMap`, `$ProjectSummary`, `$ProjectStart`, `$ProjectTarget`, `$ProjectBlurb`, `$SourceNote`, `$Records`, `$ExistingProjectId`, `$OnlyIds` |
 | `New-HaloProjectReport.ps1` | `$TYPE_PROJECT`, `$TYPE_TASK`, `$OutFile`, `$IncludeClosed`, `$OpenWhenDone`, `$AgentFilter`, `$FormerAgents` |
 | `New-HaloProjectStatusReport.ps1` | `$TYPE_PROJECT`, `$TYPE_TASK`, `$ProjectId`, `$OutFile`, `$OpenWhenDone`, `$FormerAgents`, `$NearEndPct`, `$NearEndDays`, `$DueSoonDays`, the three status-name lists, `$LateInProgressIsRed` |
+| `New-HaloProjectPortfolioReport.ps1` | `$TYPE_PROJECT`, `$TYPE_TASK`, `$OutFile`, `$OpenWhenDone`, `$IncludeClosed`, `$ProjectFilter`, `$AgentFilter`, `$AttentionLimit`, `$FormerAgents`, and the same RAG settings as the status report |
 
 ---
 
@@ -116,6 +122,38 @@ leave it blank to be asked.
 
 Defaults to `Documents\Halo-Project-<id>-<name>-<timestamp>.html`.
 
+### New-HaloProjectPortfolioReport.ps1
+
+The two reports above in a single file, for running a project meeting from one
+document. It sweeps the tenant once and writes:
+
+- a **portfolio view** — a RAG verdict per project, the manager, the rolled-up
+  window, work done against schedule elapsed, late and at-risk counts, the next
+  date due, and a timeline bar per project on one shared scale so the estate
+  reads at a glance. Worst first, because that is the order a meeting works
+  through them. Underneath it, every late or at-risk task across the whole
+  portfolio, each linking to its project.
+- a **page per project** — the full status report: the RAG verdict with its
+  reasoning, progress against schedule, who is assigned, milestones, what needs
+  attention, records with broken dates, and every task with its own timeline
+  bar and filters.
+
+Click a project to open its page, "Back to the portfolio" to return. Navigation
+is by URL fragment (`#p1234`), so a specific project can be linked or
+bookmarked, and the browser's back button works.
+
+Two print buttons, because a meeting wants both: **Print this project** prints
+the page you are on, **Print the pack** prints the portfolio and every project
+behind it, each starting on a fresh page. Both reset the filters first — a
+printed copy of a filtered table is a half-truth.
+
+Defaults to `Documents\Halo-Portfolio-<timestamp>.html`.
+
+This is the **slowest** of the three, because it is both reports at once: every
+project and every task needs an individual GET for its dates. The portfolio-only
+report is lighter, and the single-project report stays quick because it never
+sweeps the tenant, so all three remain worth keeping.
+
 ---
 
 ## Getting started
@@ -127,7 +165,7 @@ Defaults to `Documents\Halo-Project-<id>-<name>-<timestamp>.html`.
 - Authentication Method: **Client ID and Secret (Services)**
 - Login Type: **Agent** — and make sure an agent is actually selected
   underneath, not just the login type
-- Permissions: `edit:tickets` for `New-HaloProject.ps1`. The two reports use
+- Permissions: `edit:tickets` for `New-HaloProject.ps1`. The three reports use
   scope `all`, because `/api/Agent` and `/api/Status` can 403 on anything
   narrower.
 
@@ -152,7 +190,7 @@ $ApiBase = 'https://halo.example.com/api'
 
 ### 3. Supply credentials
 
-All three scripts look in the same three places, in order:
+All four scripts look in the same three places, in order:
 
 1. `$ClientId` / `$ClientSecret` in the `--- Connection` section
 2. the `HALO_CLIENT_ID` and `HALO_CLIENT_SECRET` environment variables
@@ -175,7 +213,7 @@ specific to it. Check each one:
   default to `$TYPE_PROJECT = 57` and `$TYPE_TASK = 58`. Yours will differ.
   `New-HaloProject.ps1` is better behaved: leave `$ProjectTypeId` and
   `$TaskTypeId` at `0` and its dry run prints every ticket type it can see,
-  with ids — then paste them into all three scripts. Match on **id**, never on
+  with ids — then paste them into the three reports. Match on **id**, never on
   name, because the display names carry stray whitespace.
 - **Priority and agent ids.** Same story: the dry run prints them, and you
   paste them into `$PriorityMap` and `$AgentMap`.
